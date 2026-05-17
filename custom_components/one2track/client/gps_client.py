@@ -75,11 +75,17 @@ class GpsClient():
             return await self.session.get(url, headers=headers, allow_redirects=allow_redirects, cookies=cookies)
 
     def _extract_session_cookie(self, response) -> str:
-        """Extract _iadmin cookie value from response headers.
+        """Extract _iadmin cookie value from response.
 
-        Uses proper Set-Cookie parsing instead of string splitting to handle
-        varying header formats across different server configurations.
+        Checks both response.cookies (aiohttp's parsed cookies) and raw
+        Set-Cookie headers to handle HA's shared ClientSession which may
+        process cookies into its jar without exposing them in raw headers.
         """
+        if hasattr(response, 'cookies') and SESSION_COOKIE in response.cookies:
+            value = response.cookies[SESSION_COOKIE].value
+            if value:
+                return value
+
         for header_value in response.headers.getall('Set-Cookie', []):
             sc = SimpleCookie()
             sc.load(header_value)
@@ -113,11 +119,29 @@ class GpsClient():
             new_cookie = self._extract_session_cookie(response)
             if new_cookie:
                 self.cookie = new_cookie
-                _LOGGER.debug("[login] Login success")
+                _LOGGER.debug("[login] Login success via response cookie")
+                return
+
+            # Fallback: HA's shared ClientSession may have absorbed the cookie
+            # into its jar without exposing it on the response object
+            jar_cookie = self._extract_cookie_from_session_jar()
+            if jar_cookie:
+                self.cookie = jar_cookie
+                _LOGGER.debug("[login] Login success via session jar")
                 return
 
         _LOGGER.warning("[login] Failed to login, response code: %s", response.status)
         raise AuthenticationError("Invalid username or password")
+
+    def _extract_cookie_from_session_jar(self) -> str:
+        """Extract _iadmin from the aiohttp session's cookie jar."""
+        try:
+            for cookie in self.session.cookie_jar:
+                if cookie.key == SESSION_COOKIE and cookie.value:
+                    return cookie.value
+        except Exception:
+            pass
+        return ""
 
     async def get_user_id(self):
         response = await self.call_api(f"{BASE_URL}/", allow_redirects=False)

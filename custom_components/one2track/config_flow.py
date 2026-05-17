@@ -1,7 +1,6 @@
 import logging
 
 from homeassistant import config_entries
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import voluptuous as vol
 import homeassistant.helpers.config_validation as cv
 
@@ -30,10 +29,12 @@ class One2TrackConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         user_input = user_input or {}
         if user_input:
             try:
-                session = async_get_clientsession(self.hass)
                 config = One2TrackConfig(username=user_input[CONF_USER_NAME], password=user_input[CONF_PASSWORD])
-                client = get_client(config, session)
-                account_id = await client.install()
+                client = get_client(config)
+                try:
+                    account_id = await client.install()
+                finally:
+                    await client.session.close()
 
                 _LOGGER.info(
                     "One2Track GPS: Found account: %s", account_id
