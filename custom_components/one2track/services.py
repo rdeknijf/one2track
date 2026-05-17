@@ -13,6 +13,7 @@ LOGGER = logging.getLogger(__name__)
 
 SERVICE_SEND_MESSAGE = "send_message"
 SERVICE_FORCE_UPDATE = "force_update"
+SERVICE_POWER_OFF = "power_off"
 ATTR_MESSAGE = "message"
 
 
@@ -97,6 +98,19 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             if coordinator:
                 await coordinator.async_request_refresh()
 
+    async def handle_power_off(call: ServiceCall) -> None:
+        entity_ids = call.data.get("entity_id", [])
+        if isinstance(entity_ids, str):
+            entity_ids = [entity_ids]
+
+        device_uuid = _resolve_device_uuid(hass, entity_ids)
+        client = _get_client_for_uuid(hass, device_uuid)
+
+        LOGGER.info("Sending power off to %s", device_uuid)
+        success = await client.power_off(device_uuid)
+        if not success:
+            raise HomeAssistantError("Failed to power off One2Track device")
+
     hass.services.async_register(
         DOMAIN,
         SERVICE_SEND_MESSAGE,
@@ -116,8 +130,18 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         }),
     )
 
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_POWER_OFF,
+        handle_power_off,
+        schema=vol.Schema({
+            vol.Required("entity_id"): vol.Any(str, [str]),
+        }),
+    )
+
 
 async def async_unload_services(hass: HomeAssistant) -> None:
     """Unload One2Track services."""
     hass.services.async_remove(DOMAIN, SERVICE_SEND_MESSAGE)
     hass.services.async_remove(DOMAIN, SERVICE_FORCE_UPDATE)
+    hass.services.async_remove(DOMAIN, SERVICE_POWER_OFF)

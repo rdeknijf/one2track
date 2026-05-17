@@ -1,4 +1,6 @@
 import logging
+import re
+from http.cookies import SimpleCookie
 
 from aiohttp import ClientSession
 from .client_types import (
@@ -9,12 +11,10 @@ from .client_types import (
 
 _LOGGER = logging.getLogger(__name__)
 
-CONFIG = {
-    "login_url": "https://www.one2trackgps.com/auth/users/sign_in",
-    "base_url": "https://www.one2trackgps.com/",
-    "device_url": "https://www.one2trackgps.com/users/%account%/devices",
-    "session_cookie": "_iadmin"
-}
+BASE_URL = "https://www.one2trackgps.com"
+LOGIN_URL = f"{BASE_URL}/auth/users/sign_in"
+DEVICE_URL = f"{BASE_URL}/users/{{account_id}}/devices"
+SESSION_COOKIE = "_iadmin"
 
 
 class GpsClient():
@@ -25,20 +25,22 @@ class GpsClient():
 
     def __init__(self, config: One2TrackConfig, session: ClientSession):
         self.config = config
-        self.account_id = config.id  # might be empty
+        self.account_id = config.id or ""
         self.session = session
 
     def set_account_id(self, account_id):
         self.account_id = account_id
 
     async def get_csrf(self):
-        login_page = await self.call_api(CONFIG["login_url"])
+        login_page = await self.call_api(LOGIN_URL)
         if login_page.status == 200:
             html = await login_page.text()
-            self.csrf = self.parse_csrf(html)
+            self.csrf = self._parse_csrf(html)
             _LOGGER.debug("[pre-login] Found CSRF token")
-            self.cookie = self.parse_cookie(login_page)
-            _LOGGER.debug("[pre-login] Found session cookie")
+            cookie = self._extract_session_cookie(login_page)
+            if cookie:
+                self.cookie = cookie
+                _LOGGER.debug("[pre-login] Found session cookie")
         else:
             _LOGGER.warning("[pre-login] Failed pre-login, response code: %s", login_page.status)
             raise AuthenticationError("Login page unavailable")
@@ -58,9 +60,9 @@ class GpsClient():
             headers.update(extra_headers)
 
         if self.cookie:
-            cookies['_iadmin'] = self.cookie
+            cookies[SESSION_COOKIE] = self.cookie
 
-        _LOGGER.debug('[http] %s %s %s', url, headers, cookies)
+        _LOGGER.debug('[http] %s', url)
 
         if data is not None:
             return await self.session.post(url,
@@ -72,20 +74,28 @@ class GpsClient():
         else:
             return await self.session.get(url, headers=headers, allow_redirects=allow_redirects, cookies=cookies)
 
-    def parse_cookie(self, response) -> str:
-        cookie = ""
-        if 'Set-Cookie' in response.headers:
-            cookie = response.headers['Set-Cookie']
+    def _extract_session_cookie(self, response) -> str:
+        """Extract _iadmin cookie value from response headers.
 
-        if cookie:
-            return response.headers['Set-Cookie'].split(CONFIG["session_cookie"])[1].split(";")[
-                0].replace("=", "")
-        else:
-            _LOGGER.warning("No new cookie found, old cookie: %s", self.cookie)
-            return ""
+        Uses proper Set-Cookie parsing instead of string splitting to handle
+        varying header formats across different server configurations.
+        """
+        for header_value in response.headers.getall('Set-Cookie', []):
+            sc = SimpleCookie()
+            sc.load(header_value)
+            if SESSION_COOKIE in sc:
+                value = sc[SESSION_COOKIE].value
+                if value:
+                    return value
 
-    def parse_csrf(self, html) -> str:
-        return html.split("name=\"csrf-token\" content=\"")[1].split("\"")[0]
+        _LOGGER.debug("No %s cookie in response", SESSION_COOKIE)
+        return ""
+
+    def _parse_csrf(self, html) -> str:
+        m = re.search(r'name="csrf-token"\s+content="([^"]+)"', html)
+        if not m:
+            raise AuthenticationError("CSRF token not found on page")
+        return m.group(1)
 
     async def login(self):
         login_data = {
@@ -95,21 +105,24 @@ class GpsClient():
             "gdpr": "1",
             "user[remember_me]": "1",
         }
-        response = await self.call_api(CONFIG["login_url"], data=login_data, allow_redirects=False)
+        response = await self.call_api(LOGIN_URL, data=login_data, allow_redirects=False)
 
         _LOGGER.debug("[login] Status: %s", response.status)
 
-        # login is successful when we get a fresh cookie
-        if response.status == 302 and "Set-Cookie" in response.headers:
-            _LOGGER.debug("[login] login success!")
-            self.cookie = self.parse_cookie(response)
-            _LOGGER.debug("[login] Got new session cookie")
-        else:
-            _LOGGER.warning("[login] Failed to login, response code: %s", response.status)
-            raise AuthenticationError("Invalid username or password")
+        if response.status == 302:
+            new_cookie = self._extract_session_cookie(response)
+            if new_cookie:
+                self.cookie = new_cookie
+                _LOGGER.debug("[login] Login success")
+                return
+
+        _LOGGER.warning("[login] Failed to login, response code: %s", response.status)
+        raise AuthenticationError("Invalid username or password")
 
     async def get_user_id(self):
-        response = await self.call_api(CONFIG["base_url"], allow_redirects=False)
+        response = await self.call_api(f"{BASE_URL}/", allow_redirects=False)
+        if response.status != 302 or 'Location' not in response.headers:
+            raise AuthenticationError("Could not determine account ID")
         url = response.headers['Location']
         account_id = url.split('/')[4]
         _LOGGER.debug("[install] Extracted account id from redirect")
@@ -131,22 +144,43 @@ class GpsClient():
 
     async def _get_csrf_token(self) -> str:
         """Get a fresh CSRF token for action endpoints."""
-        response = await self.call_api(CONFIG["login_url"])
+        response = await self.call_api(LOGIN_URL)
         if response.status == 200:
             html = await response.text()
-            # Update session cookie if the server sends a new one
-            new_cookie = self.parse_cookie(response)
+            new_cookie = self._extract_session_cookie(response)
             if new_cookie:
                 self.cookie = new_cookie
-            return self.parse_csrf(html)
+            return self._parse_csrf(html)
         raise AuthenticationError("Could not get CSRF token")
+
+    async def _send_function(self, device_uuid: str, code: str, name: str) -> bool:
+        """Send a function command to a device."""
+        await self._ensure_authenticated()
+        csrf = await self._get_csrf_token()
+
+        url = f"{BASE_URL}/api/devices/{device_uuid}/functions"
+
+        headers = {
+            "x-csrf-token": csrf,
+            "x-requested-with": "XMLHttpRequest",
+            "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+        }
+
+        data = {
+            "utf8": "\u2713",
+            "function[code]": code,
+            "function[name]": name,
+        }
+
+        response = await self.call_api(url, data=data, extra_headers=headers)
+        return response.status == 200
 
     async def send_message(self, device_uuid: str, message: str) -> bool:
         """Send a text message to a One2Track device."""
         await self._ensure_authenticated()
         csrf = await self._get_csrf_token()
 
-        url = f"https://www.one2trackgps.com/devices/{device_uuid}/messages"
+        url = f"{BASE_URL}/devices/{device_uuid}/messages"
 
         headers = {
             "x-csrf-token": csrf,
@@ -165,32 +199,18 @@ class GpsClient():
 
     async def force_update(self, device_uuid: str) -> bool:
         """Activate positioning mode on the device for ~2 minutes."""
-        await self._ensure_authenticated()
-        csrf = await self._get_csrf_token()
+        return await self._send_function(device_uuid, "0039", "Actieve positioneringmodus")
 
-        url = f"https://www.one2trackgps.com/api/devices/{device_uuid}/functions"
-
-        headers = {
-            "x-csrf-token": csrf,
-            "x-requested-with": "XMLHttpRequest",
-            "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-        }
-
-        data = {
-            "utf8": "\u2713",
-            "function[code]": "0039",
-            "function[name]": "Actieve positioneringmodus",
-        }
-
-        response = await self.call_api(url, data=data, extra_headers=headers)
-        return response.status == 200
+    async def power_off(self, device_uuid: str) -> bool:
+        """Shut down the device remotely."""
+        return await self._send_function(device_uuid, "0048", "Shutdown")
 
     async def update(self) -> list[TrackerDevice]:
         await self._ensure_authenticated()
         return await self.get_device_data()
 
     async def get_device_data(self) -> list[TrackerDevice]:
-        url = CONFIG["device_url"].replace("%account%", self.account_id)
+        url = DEVICE_URL.format(account_id=self.account_id)
         response = await self.call_api(url, use_json=True)
 
         if response.status != 200:
